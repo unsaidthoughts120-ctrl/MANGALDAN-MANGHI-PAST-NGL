@@ -1,92 +1,102 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Anonymous message</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    /* small custom */
-    textarea:focus { outline: none; box-shadow: 0 0 0 3px rgba(59,130,246,0.12); }
-  </style>
-</head>
-<body class="min-h-screen bg-white text-slate-800">
-  <main class="max-w-4xl mx-auto py-20 px-6">
-    <div class="flex items-start justify-between mb-6">
-      <h1 class="text-4xl font-extrabold">Anonymous message</h1>
-      <div class="text-sm text-slate-500">Secure — <span class="font-medium">token kept on server</span></div>
-    </div>
+// api/send.js
+// Vercel Node serverless function
+// Expects POST JSON: { message: "..." }
+// Uses process.env.TELEGRAM_TOKEN and process.env.TELEGRAM_CHAT_ID
 
-    <p class="text-slate-500 mb-6">Your message will be forwarded to the Telegram chat configured on the server. No tokens or IDs are stored in this page.</p>
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
+const MAX_PER_WINDOW = 6; // per IP per window (tune as needed)
 
-    <label class="block text-slate-700 font-medium mb-2">Message (max 1000 chars)</label>
-    <textarea id="message" maxlength="1000" rows="8"
-      class="w-full border border-slate-200 rounded-lg p-4 resize-none placeholder-slate-400 focus:border-slate-300"
-      placeholder="Write your anonymous message..."></textarea>
+// in-memory map of ip => [timestamps]
+// NOTE: serverless environments are ephemeral; this is best-effort.
+const ipMap = new Map();
 
-    <div class="flex items-center mt-3">
-      <input id="confirm" type="checkbox" class="h-4 w-4 text-blue-600 rounded border-slate-300">
-      <label for="confirm" class="ml-2 text-sm text-slate-600">I confirm this message is not abusive or illegal</label>
-    </div>
+function cleanupOld(ip) {
+  const now = Date.now();
+  const arr = ipMap.get(ip) || [];
+  const filtered = arr.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+  ipMap.set(ip, filtered);
+  return filtered;
+}
 
-    <div id="status" class="mt-4 text-sm text-slate-600"></div>
+// Escape Telegram MarkdownV2
+function escapeMarkdownV2(text) {
+  // per Telegram docs, escape the following characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
+  return text.replace(/([_*\[\]()~`>#+\-=|{}\.!])/g, '\\$1');
+}
 
-    <div class="mt-6">
-      <button id="sendBtn"
-        class="bg-blue-600 hover:bg-blue-700 text-white py-2 px-4 rounded-lg shadow-sm disabled:opacity-60"
-      >
-        Send anonymously
-      </button>
-    </div>
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
 
-    <p class="mt-10 text-sm text-slate-400">Note: messages are forwarded by the server to the Telegram bot you configured in Vercel environment variables.</p>
-  </main>
+  // Basic origin check - optional: you can restrict to your domain here
+  // const origin = req.headers['origin'];
+  // if (origin && !origin.includes('your-domain.com')) { ... }
 
-  <script>
-    const sendBtn = document.getElementById('sendBtn');
-    const msgEl = document.getElementById('message');
-    const confirmEl = document.getElementById('confirm');
-    const status = document.getElementById('status');
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+  const now = Date.now();
 
-    function setStatus(text, isError = false) {
-      status.textContent = text;
-      status.className = isError ? 'mt-4 text-sm text-red-600' : 'mt-4 text-sm text-slate-600';
+  // rate limit
+  const arr = cleanupOld(ip);
+  if (arr.length >= MAX_PER_WINDOW) {
+    return res.status(429).json({ error: 'Too many requests. Please wait a bit before sending another message.' });
+  }
+  arr.push(now);
+  ipMap.set(ip, arr);
+
+  let body = req.body;
+  if (!body || typeof body === 'string') {
+    try { body = JSON.parse(body || '{}'); } catch (e) { body = {}; }
+  }
+
+  const message = (body.message || '').toString().trim();
+  if (!message) {
+    return res.status(400).json({ error: 'Message is empty' });
+  }
+  if (message.length > 1000) {
+    return res.status(400).json({ error: 'Message too long (max 1000 chars)' });
+  }
+
+  // Very basic content check to reduce obvious abuse (you can expand)
+  const lower = message.toLowerCase();
+  const suspicious = [ 'http://', 'https://', 'www.', '@', 'telegram.me', 't.me' ];
+  const hasLink = suspicious.some(s => lower.includes(s));
+  if (hasLink) {
+    return res.status(400).json({ error: 'Messages containing links or @ mentions are not allowed' });
+  }
+
+  const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+  const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.error('Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID');
+    return res.status(500).json({ error: 'Server not configured' });
+  }
+
+  const escaped = escapeMarkdownV2(message);
+  const text = `*Anonymous message:*\n\n${escaped}`;
+
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: 'MarkdownV2',
+      }),
+    });
+
+    const data = await resp.json();
+    if (!resp.ok || data?.ok === false) {
+      console.error('Telegram API error', data);
+      return res.status(502).json({ error: 'Telegram API error' });
     }
 
-    sendBtn.addEventListener('click', async () => {
-      setStatus('');
-      const message = msgEl.value.trim();
-      if (!message) {
-        setStatus('Please write a message first.', true);
-        return;
-      }
-      if (!confirmEl.checked) {
-        setStatus('Please confirm the message is not abusive or illegal.', true);
-        return;
-      }
-      sendBtn.disabled = true;
-      setStatus('Sending...');
-      try {
-        const res = await fetch('/api/send', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message }),
-        });
-
-        const j = await res.json();
-        if (!res.ok) {
-          setStatus(j?.error || 'Failed to send message', true);
-        } else {
-          setStatus('Message sent. Thank you!');
-          msgEl.value = '';
-          confirmEl.checked = false;
-        }
-      } catch (err) {
-        setStatus('Network error. Try again later.', true);
-      } finally {
-        sendBtn.disabled = false;
-      }
-    });
-  </script>
-</body>
-</html>
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('Send failure', err);
+    return res.status(500).json({ error: 'Failed to send message' });
+  }
+}
